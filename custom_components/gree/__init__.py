@@ -17,8 +17,8 @@ from homeassistant.const import (
     CONF_PORT,
     Platform,
 )
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse, callback
+from homeassistant.exceptions import ConfigEntryError, HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -262,10 +262,75 @@ def _async_move_device_back(
         _LOGGER.warning("Going back from %s: cannot move device %s: %s", SUCCESSOR_DOMAIN, device_id, err)
 
 
+# Raw access to the unit, for properties the entities don't cover
+SERVICE_GET_VALUES = "get_values"
+SERVICE_SEND_COMMAND = "send_command"
+SERVICE_REDETECT_COMMAND_SUPPORT = "redetect_command_support"
+
+GET_VALUES_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): cv.entity_id,
+        vol.Required("properties"): vol.All(cv.ensure_list, [cv.string]),
+    }
+)
+SEND_COMMAND_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): cv.entity_id,
+        vol.Required("values"): vol.All({cv.string: vol.Coerce(int)}, vol.Length(min=1)),
+    }
+)
+REDETECT_SCHEMA = vol.Schema({vol.Required("entity_id"): cv.entity_id})
+
+
+def _device_for_entity(hass: HomeAssistant, entity_id: str):
+    """Return the Gree climate device behind a climate entity id."""
+    for entry_data in hass.data.get(DOMAIN, {}).values():
+        if isinstance(entry_data, dict):
+            device = entry_data.get("device")
+            if device is not None and device.entity_id == entity_id:
+                return device
+    raise ServiceValidationError(f"{entity_id} is not a Gree climate entity")
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    async def get_values(call: ServiceCall) -> ServiceResponse:
+        device = _device_for_entity(hass, call.data["entity_id"])
+        try:
+            values = await device.GreeGetValuesDict(call.data["properties"])
+        except Exception as err:
+            raise HomeAssistantError(f"The unit did not answer: {err}") from err
+        return {
+            "values": values,
+            "unknown": [prop for prop in call.data["properties"] if prop not in values],
+        }
+
+    async def send_command(call: ServiceCall) -> ServiceResponse:
+        device = _device_for_entity(hass, call.data["entity_id"])
+        try:
+            result = await device.async_send_raw_command(call.data["values"])
+        except Exception as err:
+            raise HomeAssistantError(
+                "The unit did not answer. Some units silently drop a command that contains a property they don't support"
+            ) from err
+        return {"properties": result.get("opt", []), "values": result.get("val", result.get("p", []))}
+
+    async def redetect_command_support(call: ServiceCall) -> ServiceResponse:
+        device = _device_for_entity(hass, call.data["entity_id"])
+        rejected = await device.async_redetect_command_support()
+        if rejected is None:
+            raise HomeAssistantError("The unit did not answer reliably, try again later")
+        return {"rejected": rejected}
+
+    hass.services.async_register(DOMAIN, SERVICE_GET_VALUES, get_values, schema=GET_VALUES_SCHEMA, supports_response=SupportsResponse.ONLY)
+    hass.services.async_register(DOMAIN, SERVICE_SEND_COMMAND, send_command, schema=SEND_COMMAND_SCHEMA, supports_response=SupportsResponse.OPTIONAL)
+    hass.services.async_register(DOMAIN, SERVICE_REDETECT_COMMAND_SUPPORT, redetect_command_support, schema=REDETECT_SCHEMA, supports_response=SupportsResponse.OPTIONAL)
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Gree component from yaml."""
     successor_installed = await _async_successor_installed(hass)
     hass.data.setdefault(DOMAIN, {})[DATA_SUCCESSOR_INSTALLED] = successor_installed
+    _register_services(hass)
     if successor_installed:
         _start_successor(hass, config)
     else:

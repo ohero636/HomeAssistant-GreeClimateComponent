@@ -5,6 +5,31 @@ Custom Gree climate component written in Python3 for Home Assistant. Controls AC
 
 For a comprehensive list of tested devices, see [Supported Devices](supported-devices.md).
 
+## About this fork
+Fork of [RobHofmann/HomeAssistant-GreeClimateComponent](https://github.com/RobHofmann/HomeAssistant-GreeClimateComponent) with:
+
+- **Command field detection.** Some WiFi modules (seen on W06DV3.01, firmware V1.0.0.0) silently drop a whole command if it contains one property they don't support, even properties they report in status reads (`Health`, `Lig`, `StHt`, `Buzzer_ON_OFF`, `BuzzerCtrl` on that module). The integration finds those properties once per unit (by resending the unit's current state), leaves them out of commands and makes their switches unavailable. The result is kept across restarts and shown in the **Rejected Command Fields** diagnostic sensor.
+- **Error Code** diagnostic sensor (`AllErr`), and the WiFi module firmware on the device page.
+- **Raw access services**, for properties no entity covers:
+  - `gree.get_values` reads properties and returns them (properties the unit doesn't know are listed under `unknown`).
+  - `gree.send_command` writes properties exactly as given.
+  - `gree.redetect_command_support` runs the command field detection again.
+
+```yaml
+action: gree.get_values
+data:
+  entity_id: climate.heat_pump
+  properties: ["Pow", "Mod", "SetTem", "AllErr", "hid", "ver"]
+response_variable: gree
+```
+
+```yaml
+action: gree.send_command
+data:
+  entity_id: climate.heat_pump
+  values: {"Quiet": 1}
+```
+
 Tested on Home Assistant 2025.6.3 
 
 **If you are experiencing issues please be sure to provide details about your device, Home Assistant version and what exactly went wrong.**

@@ -27,6 +27,12 @@ from .entity import GreeEntity, GreeEntityDescription
 _LOGGER = logging.getLogger(__name__)
 
 
+def _cmd_rejected(device, *props: str) -> bool:
+    """Return True if the unit rejects commands containing all of ``props``."""
+    rejected = getattr(device, "_unsupported_cmd_fields", None)
+    return bool(rejected) and all(prop in rejected for prop in props)
+
+
 def _prop_supported(device, prop: str) -> bool:
     """Return True if the entity should be available for ``prop``.
 
@@ -39,6 +45,8 @@ def _prop_supported(device, prop: str) -> bool:
     climate entity's availability instead of hiding. That also honours
     "Disable Available Check", which leaves ``_device_online`` unset.
     """
+    if _cmd_rejected(device, prop):
+        return False
     value = device._acOptions.get(prop, "")
     if value in ("", None):
         # Unknown until the first successful sync populates _acOptions. If we
@@ -186,14 +194,14 @@ SWITCHES: tuple[GreeSwitchEntityDescription, ...] = (
         icon="mdi:weather-windy",
         value_fn=lambda device: device._acOptions.get("AntiDirectBlow") == 1,
         set_fn=_set_anti_direct_blow,
-        available_fn=lambda device: getattr(device, "_has_anti_direct_blow", False),
+        available_fn=lambda device: getattr(device, "_has_anti_direct_blow", False) and not _cmd_rejected(device, "AntiDirectBlow"),
     ),
     GreeSwitchEntityDescription(
         property_key="light_sensor",
         icon="mdi:lightbulb-on",
         value_fn=lambda device: device._acOptions.get("LigSen") == 0,  # LigSen=0 means sensor is active
         set_fn=_set_light_sensor,
-        available_fn=lambda device: getattr(device, "_has_light_sensor", False),
+        available_fn=lambda device: getattr(device, "_has_light_sensor", False) and not _cmd_rejected(device, "LigSen"),
     ),
     # These entities are not kept in the climate device
     GreeSwitchEntityDescription(
@@ -201,6 +209,7 @@ SWITCHES: tuple[GreeSwitchEntityDescription, ...] = (
         icon="mdi:fan-auto",
         value_fn=lambda device: getattr(device, "_auto_xfan", False),
         set_fn=_set_auto_xfan,
+        available_fn=lambda device: not _cmd_rejected(device, "Blo"),
         restore_state=True,
         entity_category=EntityCategory.CONFIG,
     ),
@@ -209,6 +218,7 @@ SWITCHES: tuple[GreeSwitchEntityDescription, ...] = (
         icon="mdi:lightbulb-auto",
         value_fn=lambda device: getattr(device, "_auto_light", False),
         set_fn=_set_auto_light,
+        available_fn=lambda device: not _cmd_rejected(device, "Lig"),
         restore_state=True,
         entity_category=EntityCategory.CONFIG,
     ),
@@ -217,6 +227,7 @@ SWITCHES: tuple[GreeSwitchEntityDescription, ...] = (
         icon="mdi:volume-high",
         value_fn=lambda device: getattr(device, "_beeper_enabled", True),
         set_fn=_set_beeper,
+        available_fn=lambda device: not _cmd_rejected(device, "Buzzer_ON_OFF", "BuzzerCtrl"),
         restore_state=True,
     ),
 )

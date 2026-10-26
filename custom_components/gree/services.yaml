@@ -1,0 +1,36 @@
+get_values:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: gree
+          domain: climate
+    properties:
+      required: true
+      example: '["Pow", "SetTem", "AllErr"]'
+      selector:
+        object:
+
+send_command:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: gree
+          domain: climate
+    values:
+      required: true
+      example: '{"Quiet": 1}'
+      selector:
+        object:
+
+redetect_command_support:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: gree
+          domain: climate

@@ -119,7 +119,7 @@ def _classify_unreachable(ip_addr, port, timeout=2):
             pass
 
 
-async def FetchResult(cipher, ip_addr, port, json_data, encryption_version=1, max_retries=8):
+async def FetchResult(cipher, ip_addr, port, json_data, encryption_version=1, max_retries=8, log_failure=True):
     """Send a request to a Gree device and fetch the result, with retries and timeouts."""
 
     _LOGGER.debug(f"Fetching device at: {ip_addr}:{port}, data sent: {json_data})")
@@ -168,6 +168,8 @@ async def FetchResult(cipher, ip_addr, port, json_data, encryption_version=1, ma
 
         except Exception as e:
             if attempt == max_retries - 1:
+                if not log_failure:
+                    raise
                 error_msg = f"{type(e).__name__}: {str(e)}" if str(e) else f"{type(e).__name__}"
                 state, details = await asyncio.get_event_loop().run_in_executor(
                     None, _classify_unreachable, ip_addr, port

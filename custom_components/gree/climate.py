@@ -5,6 +5,7 @@ This module defines the climate (HVAC) unit for the Gree integration.
 """
 
 # Standard library imports
+import asyncio
 import base64
 import logging
 import time
@@ -27,8 +28,10 @@ from homeassistant.const import (
     CONF_NAME,
     CONF_PORT,
 )
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.storage import Store
 
 # Local imports
 from .const import (
@@ -62,10 +65,15 @@ REQUIREMENTS = ["pycryptodome"]
 
 _LOGGER = logging.getLogger(__name__)
 
-# Command fields that make some WiFi modules drop the entire command without
-# replying. Verified on a V1.0.0.0 module (mid 3018): status reads of these work,
-# but any "cmd" that includes one of them gets no answer.
-UNSUPPORTED_CMD_FIELDS = {"Health", "Lig", "StHt", "Buzzer_ON_OFF", "BuzzerCtrl"}
+# Some WiFi modules (e.g. W06DV3.01, firmware V1.0.0.0) silently drop a whole
+# "cmd" if it contains one field they don't support, even fields they report in
+# status reads (seen with Health, Lig, StHt and the buzzer fields). Which fields
+# are rejected is detected once per device and kept in this store.
+CMD_SUPPORT_STORE_KEY = f"{DOMAIN}.command_support"
+CMD_SUPPORT_STORE_VERSION = 1
+BUZZER_FIELDS = ("Buzzer_ON_OFF", "BuzzerCtrl")
+# Serializes read-modify-write of the store across devices
+_CMD_SUPPORT_STORE_LOCK = asyncio.Lock()
 
 SUPPORT_FLAGS = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
 
@@ -212,6 +220,17 @@ class GreeClimate(ClimateEntity):
         self._current_outside_temperature = None
         self._current_room_humidity = None
 
+        self._has_error_code = None
+        # WiFi module identifiers ("hid" and "ver"), read once for the device page
+        self._module_info_read = False
+        self._module_firmware = None
+        self._module_version = None
+
+        # None until detected, then the set of fields this unit rejects in a "cmd"
+        self._unsupported_cmd_fields: set[str] | None = None
+        self._cmd_probe_lock = asyncio.Lock()
+        self._cmd_probe_task = None
+
         self._firstTimeRun = True
 
         self._enable_turn_on_off_backwards_compatibility = False
@@ -286,7 +305,7 @@ class GreeClimate(ClimateEntity):
         # helper method to determine TemSen offset
         self._process_temp_sensor = TempOffsetResolver()
 
-    async def GreeGetValues(self, propertyNames):
+    async def _query_status(self, propertyNames):
         plaintext = '{"cols":' + simplejson.dumps(propertyNames) + ',"mac":"' + str(self._sub_mac_addr) + '","t":"status"}'
         if self.encryption_version == 1:
             cipher = self.CIPHER
@@ -295,11 +314,36 @@ class GreeClimate(ClimateEntity):
             pack, tag = EncryptGCM(self._encryption_key, plaintext)
             jsonPayloadToSend = '{"cid":"app","i":0,"pack":"' + pack + '","t":"pack","tcid":"' + str(self._mac_addr) + '","uid":{}'.format(self._uid) + ',"tag" : "' + tag + '"}'
             cipher = GetGCMCipher(self._encryption_key)
-        result = await FetchResult(cipher, self._ip_addr, self._port, jsonPayloadToSend, encryption_version=self.encryption_version)
+        return await FetchResult(cipher, self._ip_addr, self._port, jsonPayloadToSend, encryption_version=self.encryption_version)
+
+    async def GreeGetValues(self, propertyNames):
+        result = await self._query_status(propertyNames)
 
         if not result["dat"]:
             return None
         return result["dat"][0] if len(result["dat"]) == 1 else result["dat"]
+
+    async def GreeGetValuesDict(self, propertyNames) -> dict:
+        """Read properties by name. Properties the unit doesn't know are left out."""
+        result = await self._query_status(propertyNames)
+        return dict(zip(result.get("cols") or [], result.get("dat") or []))
+
+    async def _read_module_info(self):
+        """Show the WiFi module firmware on the device page."""
+        try:
+            info = await self.GreeGetValuesDict(["hid", "ver"])
+        except Exception:
+            _LOGGER.debug("Could not read the WiFi module info. Retrying at next update()")
+            return
+        self._module_info_read = True
+        self._module_firmware = info.get("hid") or None
+        self._module_version = info.get("ver") or None
+        if not (self._module_firmware or self._module_version):
+            return
+        registry = dr.async_get(self.hass)
+        device = registry.async_get_device(identifiers={(DOMAIN, self._sub_mac_addr)})
+        if device is not None:
+            registry.async_update_device(device.id, sw_version=self._module_version, hw_version=self._module_firmware)
 
     def SetAcOptions(self, acOptions, newOptionsToOverride, optionValuesToOverride=None):
         if optionValuesToOverride is not None:
@@ -328,7 +372,8 @@ class GreeClimate(ClimateEntity):
             and self._use_add_half_degree
         )
 
-    async def SendStateToAc(self):
+    def _command_fields(self) -> dict:
+        """Return the full state a command carries, as property -> value."""
         opt_list = ["Pow", "Mod", "SetTem", "WdSpd", "Air", "Blo", "Health", "SwhSlp", "Lig", "SwingLfRig", "SwUpDn", "Quiet", "Tur", "StHt", "TemUn", "HeatCoolType", "TemRec", "SvSt", "SlpMod", "AntiDirectBlow", "LigSen"]
 
         if self.uses_add_half_degree:
@@ -341,30 +386,16 @@ class GreeClimate(ClimateEntity):
             p_values[opt_list.index("TemRec")] = 0
 
         # Filter out empty ones
-        filtered_opt = []
-        filtered_p = []
-        for name, val in zip(opt_list, p_values):
-            if val not in ("", None):
-                filtered_opt.append(f'"{name}"')
-                filtered_p.append(str(val))
+        fields = {name: val for name, val in zip(opt_list, p_values) if val not in ("", None)}
 
-        buzzer_command_value = 0 if self._beeper_enabled else 1
-        filtered_opt.append('"Buzzer_ON_OFF"')
-        filtered_p.append(str(buzzer_command_value))
-
+        fields["Buzzer_ON_OFF"] = 0 if self._beeper_enabled else 1
         # Newer firmwares use this, not inverted
-        filtered_opt.append('"BuzzerCtrl"')
-        filtered_p.append(str(1 if self._beeper_enabled else 0))
+        fields["BuzzerCtrl"] = 1 if self._beeper_enabled else 0
+        return fields
 
-        _LOGGER.debug(f"{self._name}: Sending command with beeper {'enabled' if self._beeper_enabled else 'disabled'} (buzzer={buzzer_command_value})")
-
-        # Some modules (e.g. firmware V1.0.0.0) silently drop the whole
-        # command if it contains a field they don't support, so leave those out.
-        kept = [(o, p) for o, p in zip(filtered_opt, filtered_p) if o.strip('"') not in UNSUPPORTED_CMD_FIELDS]
-        filtered_opt = [o for o, _ in kept]
-        filtered_p = [p for _, p in kept]
-
-        statePackJson = '{"opt":[' + ",".join(filtered_opt) + '],"p":[' + ",".join(filtered_p) + '],"t":"cmd","sub":"' + self._sub_mac_addr + '"}'
+    async def _send_command(self, fields: dict, max_retries=8, log_failure=True):
+        """Send a "cmd" setting each property in fields, and return the reply."""
+        statePackJson = '{"opt":[' + ",".join(f'"{name}"' for name in fields) + '],"p":[' + ",".join(str(val) for val in fields.values()) + '],"t":"cmd","sub":"' + self._sub_mac_addr + '"}'
 
         if self.encryption_version == 1:
             cipher = self.CIPHER
@@ -373,8 +404,96 @@ class GreeClimate(ClimateEntity):
             pack, tag = EncryptGCM(self._encryption_key, statePackJson)
             sentJsonPayload = '{"cid":"app","i":0,"pack":"' + pack + '","t":"pack","tcid":"' + str(self._mac_addr) + '","uid":{}'.format(self._uid) + ',"tag":"' + tag + '"}'
             cipher = GetGCMCipher(self._encryption_key)
-        result = await FetchResult(cipher, self._ip_addr, self._port, sentJsonPayload, encryption_version=self.encryption_version)
+        return await FetchResult(cipher, self._ip_addr, self._port, sentJsonPayload, encryption_version=self.encryption_version, max_retries=max_retries, log_failure=log_failure)
+
+    async def SendStateToAc(self):
+        fields = self._command_fields()
+
+        if self._unsupported_cmd_fields is None:
+            await self._detect_command_support()
+        if self._unsupported_cmd_fields:
+            fields = {name: val for name, val in fields.items() if name not in self._unsupported_cmd_fields}
+
+        _LOGGER.debug(f"{self._name}: Sending command with beeper {'enabled' if self._beeper_enabled else 'disabled'}")
+        result = await self._send_command(fields)
         _LOGGER.debug(f"{self._name}: Command sent successfully: {str(result)}")
+
+    async def _find_rejected_fields(self, fields: dict) -> set[str]:
+        """Bisect fields down to the ones that make the unit drop a command.
+
+        Every value sent is the unit's current one, so nothing changes on it.
+        """
+        try:
+            await self._send_command(fields, max_retries=2, log_failure=False)
+            return set()
+        except Exception:
+            if len(fields) == 1:
+                return set(fields)
+        items = list(fields.items())
+        middle = len(items) // 2
+        return await self._find_rejected_fields(dict(items[:middle])) | await self._find_rejected_fields(dict(items[middle:]))
+
+    async def _detect_command_support(self):
+        """Find out once which command fields this unit rejects, and remember it."""
+        async with self._cmd_probe_lock:
+            if self._unsupported_cmd_fields is not None:
+                return
+
+            async with _CMD_SUPPORT_STORE_LOCK:
+                saved = await Store(self.hass, CMD_SUPPORT_STORE_VERSION, CMD_SUPPORT_STORE_KEY).async_load() or {}
+            if self._sub_mac_addr in saved:
+                self._unsupported_cmd_fields = set(saved[self._sub_mac_addr])
+                _LOGGER.debug(f"{self._name}: Known rejected command fields: {sorted(self._unsupported_cmd_fields)}")
+                return
+
+            fields = self._command_fields()
+            if "Pow" not in fields:
+                # Not synced with the unit yet
+                return
+
+            _LOGGER.info(f"{self._name}: Detecting which command fields the unit accepts (resends its current state)")
+            try:
+                rejected = await self._find_rejected_fields(fields)
+                if "Pow" in rejected:
+                    # Every unit takes Pow, so the unit stopped answering midway
+                    raise TimeoutError("unit stopped answering")
+                if rejected:
+                    # Confirm the rest goes through, so a hiccup isn't stored for good
+                    await self._send_command({name: val for name, val in fields.items() if name not in rejected}, max_retries=2, log_failure=False)
+            except Exception as e:
+                _LOGGER.debug(f"{self._name}: Command field detection incomplete, retrying later: {type(e).__name__}: {e}")
+                return
+
+            self._unsupported_cmd_fields = rejected
+            async with _CMD_SUPPORT_STORE_LOCK:
+                store = Store(self.hass, CMD_SUPPORT_STORE_VERSION, CMD_SUPPORT_STORE_KEY)
+                saved = await store.async_load() or {}
+                saved[self._sub_mac_addr] = sorted(rejected)
+                await store.async_save(saved)
+
+            if rejected:
+                _LOGGER.warning(f"{self._name}: The unit rejects commands containing {', '.join(sorted(rejected))}; these are left out and their controls are unavailable")
+            else:
+                _LOGGER.info(f"{self._name}: The unit accepts all command fields")
+
+    async def async_redetect_command_support(self):
+        """Forget the stored result and detect the rejected command fields again."""
+        async with self._cmd_probe_lock:
+            async with _CMD_SUPPORT_STORE_LOCK:
+                store = Store(self.hass, CMD_SUPPORT_STORE_VERSION, CMD_SUPPORT_STORE_KEY)
+                saved = await store.async_load() or {}
+                saved.pop(self._sub_mac_addr, None)
+                await store.async_save(saved)
+            self._unsupported_cmd_fields = None
+        await self._detect_command_support()
+        return sorted(self._unsupported_cmd_fields) if self._unsupported_cmd_fields is not None else None
+
+    async def async_send_raw_command(self, values: dict) -> dict:
+        """Send properties to the unit as given, then refresh the state."""
+        result = await self._send_command(values, max_retries=3, log_failure=False)
+        await self.async_update()
+        self.async_write_ha_state()
+        return result
 
     def UpdateHATargetTemperature(self):
         # Sync set temperature to HA. If 8℃ heating is active we set the temp in HA to 8℃ so that it shows the same as the AC display.
@@ -651,6 +770,21 @@ class GreeClimate(ClimateEntity):
                     self._has_room_humidity_sensor = False
                     _LOGGER.debug("Device has no room humidity sensor")
 
+        # Check if device reports an error code
+        if self._has_error_code is None:
+            try:
+                error_code = await self.GreeGetValues(["AllErr"])
+            except Exception:
+                _LOGGER.debug("Could not determine whether device reports an error code. Retrying at next update()")
+            else:
+                self._has_error_code = error_code is not None
+                if self._has_error_code:
+                    self._acOptions.update({"AllErr": None})
+                    self._optionsToFetch.append("AllErr")
+
+        if not self._module_info_read:
+            await self._read_module_info()
+
         optionsToFetch = self._optionsToFetch
 
         try:
@@ -668,6 +802,9 @@ class GreeClimate(ClimateEntity):
                     self._device_online = True
             # Set latest status from device
             self._acOptions = self.SetAcOptions(self._acOptions, optionsToFetch, currentValues)
+
+            if self._unsupported_cmd_fields is None and (self._cmd_probe_task is None or self._cmd_probe_task.done()):
+                self._cmd_probe_task = self.hass.async_create_background_task(self._detect_command_support(), f"{DOMAIN} detect command support {self._sub_mac_addr}")
 
             # Snapshot what the device actually reported this cycle, so we can
             # confirm pending commands against the *device's* value rather than

@@ -210,6 +210,14 @@
       "room_humidity": {
         "name": "Room Humidity",
         "description": "Shows the room humidity level measured by the air conditioner's internal sensor."
+      },
+      "error_code": {
+        "name": "Error Code",
+        "description": "Error code reported by the unit (AllErr). 0 means no error."
+      },
+      "rejected_command_fields": {
+        "name": "Rejected Command Fields",
+        "description": "Properties this unit drops a whole command for. They are left out of commands and their controls are unavailable."
       }
     },
     "switch": {
@@ -264,6 +272,46 @@
       "beeper": {
         "name": "Beeper",
         "description": "Controls the beeper sounds from the air conditioner unit. When enabled, the unit will make sounds for button presses and status changes."
+      }
+    }
+  },
+  "services": {
+    "get_values": {
+      "name": "Get values",
+      "description": "Read raw properties from the unit. Properties the unit doesn't know are listed under 'unknown'.",
+      "fields": {
+        "entity_id": {
+          "name": "Entity",
+          "description": "The Gree climate entity."
+        },
+        "properties": {
+          "name": "Properties",
+          "description": "List of Gree property names, e.g. [\"Pow\", \"SetTem\", \"AllErr\"]."
+        }
+      }
+    },
+    "send_command": {
+      "name": "Send command",
+      "description": "Write raw properties to the unit exactly as given, e.g. {\"Quiet\": 1}. A unit may silently drop a command containing a property it doesn't support.",
+      "fields": {
+        "entity_id": {
+          "name": "Entity",
+          "description": "The Gree climate entity."
+        },
+        "values": {
+          "name": "Values",
+          "description": "Property names mapped to integer values."
+        }
+      }
+    },
+    "redetect_command_support": {
+      "name": "Redetect command support",
+      "description": "Detect again which command properties the unit rejects, e.g. after a WiFi module firmware update. Resends the unit's current state.",
+      "fields": {
+        "entity_id": {
+          "name": "Entity",
+          "description": "The Gree climate entity."
+        }
       }
     }
   }

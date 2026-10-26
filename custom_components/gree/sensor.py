@@ -16,6 +16,7 @@ from homeassistant.components.sensor import (
 from homeassistant.const import (
     PERCENTAGE,
 )
+from homeassistant.helpers.entity import EntityCategory
 
 
 # Local imports
@@ -49,6 +50,20 @@ SENSORS: tuple[GreeSensorEntityDescription, ...] = (
         suggested_display_precision=0,
         value_fn=lambda device: device.room_humidity if device._has_room_humidity_sensor else None,
         available_fn=lambda device: device.available and device._has_room_humidity_sensor,
+    ),
+    GreeSensorEntityDescription(
+        property_key="error_code",
+        icon="mdi:alert-circle-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda device: device._acOptions.get("AllErr") if device._has_error_code else None,
+        available_fn=lambda device: device.available and bool(device._has_error_code),
+    ),
+    GreeSensorEntityDescription(
+        property_key="rejected_command_fields",
+        icon="mdi:cancel",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda device: (", ".join(sorted(device._unsupported_cmd_fields)) or "none") if device._unsupported_cmd_fields is not None else None,
+        available_fn=lambda device: device._unsupported_cmd_fields is not None,
     ),
 )
 
