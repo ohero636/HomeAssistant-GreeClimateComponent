@@ -62,6 +62,11 @@ REQUIREMENTS = ["pycryptodome"]
 
 _LOGGER = logging.getLogger(__name__)
 
+# Command fields that make some WiFi modules drop the entire command without
+# replying. Verified on a V1.0.0.0 module (mid 3018): status reads of these work,
+# but any "cmd" that includes one of them gets no answer.
+UNSUPPORTED_CMD_FIELDS = {"Health", "Lig", "StHt", "Buzzer_ON_OFF", "BuzzerCtrl"}
+
 SUPPORT_FLAGS = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
 
 
@@ -352,6 +357,12 @@ class GreeClimate(ClimateEntity):
         filtered_p.append(str(1 if self._beeper_enabled else 0))
 
         _LOGGER.debug(f"{self._name}: Sending command with beeper {'enabled' if self._beeper_enabled else 'disabled'} (buzzer={buzzer_command_value})")
+
+        # Some modules (e.g. firmware V1.0.0.0) silently drop the whole
+        # command if it contains a field they don't support, so leave those out.
+        kept = [(o, p) for o, p in zip(filtered_opt, filtered_p) if o.strip('"') not in UNSUPPORTED_CMD_FIELDS]
+        filtered_opt = [o for o, _ in kept]
+        filtered_p = [p for _, p in kept]
 
         statePackJson = '{"opt":[' + ",".join(filtered_opt) + '],"p":[' + ",".join(filtered_p) + '],"t":"cmd","sub":"' + self._sub_mac_addr + '"}'
 
